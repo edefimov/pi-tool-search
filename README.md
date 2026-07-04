@@ -69,12 +69,14 @@ Add a `toolSearch` block to `settings.json`:
 
 Unknown names in `alwaysEnabled` are silently ignored until they appear in manifest. `alwaysEnabled` is read at each `session_start`, so changes take effect on next session without reinstall. `showToolSearchFooterStatus` is re-read on refresh; set it to `false` to clear/hide the tool-search footer status.
 
-## Same-response activation caveat
+## How tool activation actually works (and why `tool_search` ends the turn)
 
-If model emits `tool_search(...)` and newly enabled tool in same assistant response, second call can still fail because provider already received old tool schema for that response. Extension now mitigates this by:
+Pi freezes the tool list sent to the model **once per agent run** (a snapshot taken when the run starts). If a tool is enabled mid-run via `setActiveTools`, it does **not** appear in the request schema and is not dispatchable until a *fresh* run begins. Without handling this, the model keeps calling `tool_search` for a tool it just enabled, getting "Already active" back forever — an infinite loop.
 
-- telling model to call `tool_search` alone
-- re-applying active tools on every `turn_start`
-- queueing hidden steer hint after successful enable so agent can retry in next turn without waiting for another user message
+`pi-tool-search` breaks this by design:
 
-Result: failure no longer needs fresh user message to recover. Retry can happen in immediate next agent turn.
+- `tool_search` returns `terminate: true`, which **ends the current run immediately** after enabling (so the model never loops on `tool_search` within one run).
+- It then schedules a hidden **fresh turn** once the agent is idle (`sendMessage` with `triggerTurn` while idle → a new `agent.prompt()` → a new snapshot that *does* include the enabled tools).
+- That fresh turn tells the model the tools are now directly callable, so it calls them directly instead of re-enabling.
+
+Net effect: the agent enables a tool, the turn auto-continues, and the tool is usable. There is one extra turn boundary per enable — this is the price of working around the frozen-snapshot behavior entirely from an extension, without patching `pi-coding-agent`/`pi-agent-core`. Always call `tool_search` alone (never batch it with the tool you intend to use).

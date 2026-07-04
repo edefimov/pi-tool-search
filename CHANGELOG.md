@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0] - 2026-07-02
+
+### Bug Fixes
+- Fix the `tool_search` infinite loop where the agent kept calling `tool_search` with already-active tool names instead of calling the enabled tool.
+
+### Changed
+- Root cause: pi freezes the tool list per agent run (`createContextSnapshot` in `pi-agent-core`), so a tool enabled mid-run via `setActiveTools` is invisible to the request schema and to tool dispatch until a fresh run starts. `setActiveToolsByName` also reassigns `state.tools` to a new array, so the in-flight run never sees it.
+- `tool_search` now returns `terminate: true` to end the current (stale) run immediately, then schedules a hidden fresh turn once the agent is idle. That fresh turn takes a new snapshot which includes the enabled tools, so the model can call them directly instead of looping on `tool_search`.
+- Trade-off: one extra turn boundary per `tool_search` call (the agent auto-continues).
+
 ## [0.3.6] - 2026-04-24
 
 ### Bug Fixes

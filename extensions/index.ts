@@ -8,7 +8,9 @@
  * Design:
  *  - session_start       → snapshot all tools, seed unlocked set with core tools
  *  - turn_start          → rebuild manifest before every LLM call, re-register tool_search, setActiveTools
- *  - tool_search.execute → validate names, add to unlocked set, call setActiveTools, queue hidden retry hint
+ *  - tool_search.execute → validate names, add to unlocked set, setActiveTools, return terminate:true to
+ *                           end the current run (tool schemas are frozen per run), then schedule a fresh
+ *                           turn once idle so the enabled tools are actually in the next request's schema
  *
  * User config (settings.json):
  *  "toolSearch": { "alwaysEnabled": ["lsp", "grep"], "showToolSearchFooterStatus": true }
@@ -77,7 +79,7 @@ export default function toolSearchExtension(pi: ExtensionAPI) {
 
     parts.push(`Enable tools by name before calling them. All tools below are hidden until you enable them here.
 
-IMPORTANT: After calling tool_search, STOP and wait for the result. Do NOT call any newly-enabled tool in the same response as tool_search — the tool schema is fixed for the current response, so the call will fail with "Tool not found". Call tool_search alone, then invoke the unlocked tools in your next response.`);
+IMPORTANT: Call tool_search ALONE — never batch it with other tool calls. Enabling a tool ENDS the current turn automatically; the turn then continues by itself and the newly-enabled tools become directly callable. You do not need to do anything between enabling and using a tool. Never call tool_search for a tool that is already active.`);
 
     if (active.length) {
       parts.push(`Already active (do NOT call tool_search for these):\n${activeLines}`);
@@ -87,7 +89,7 @@ IMPORTANT: After calling tool_search, STOP and wait for the result. Do NOT call 
       parts.push(`Available tools (hidden — enable via tool_search):\n${hiddenLines}`);
     }
 
-    parts.push(`Pass one or more exact tool names. After enabling, call those tools directly in a SUBSEQUENT response (not the same one as tool_search).`);
+    parts.push(`Pass one or more exact tool names. After enabling, the turn ends automatically and the tools become callable in the next turn.`);
 
     return parts.join("\n\n");
   }
@@ -108,12 +110,43 @@ IMPORTANT: After calling tool_search, STOP and wait for the result. Do NOT call 
     }
   }
 
+  // Tool schemas are frozen for the duration of one agent run: createContextSnapshot
+  // in pi-agent-core takes state.tools.slice() once per run, and setActiveToolsByName
+  // reassigns state.tools to a new array — so a tool enabled mid-run is invisible to
+  // BOTH the provider request schema AND the dispatch lookup until a FRESH run starts.
+  // That mismatch is what caused the tool_search infinite loop (the model could only
+  // reach for the new tool via tool_search, getting "Already active" forever).
+  //
+  // Fix: tool_search returns terminate:true to end the stale run immediately, then
+  // this helper schedules a fresh turn once the agent is idle. sendMessage with
+  // triggerTurn while idle calls agent.prompt(), which takes a new snapshot that
+  // finally includes the enabled tools — so the model can call them directly.
+  function scheduleResume(ctx: { isIdle(): boolean }, content: string) {
+    let tries = 0;
+    const tick = () => {
+      try {
+        if (ctx.isIdle()) {
+          pi.sendMessage(
+            { customType: "tool-search-resume", content, display: false },
+            { triggerTurn: true },
+          );
+          return;
+        }
+      } catch {
+        return; // session torn down — give up silently
+      }
+      if (tries++ < 100) setTimeout(tick, 20); // ~2s ceiling
+    };
+    // Fire after the current (terminating) run unwinds and flips isStreaming=false.
+    setTimeout(tick, 0);
+  }
+
   function registerToolSearch() {
     pi.registerTool({
       name: "tool_search",
       label: "Tool Search",
       description: buildDescription(),
-      promptSnippet: "Enable hidden tools by name. Call tool_search ALONE, then use unlocked tools in next turn. If same-response call fails, retry next turn.",
+      promptSnippet: "Enable hidden tools by name. Call tool_search ALONE — it ends the turn and the tools become callable in the next turn automatically. Never re-enable already-active tools.",
       parameters: Type.Object({
         names: Type.Array(Type.String(), {
           description:
@@ -139,29 +172,43 @@ IMPORTANT: After calling tool_search, STOP and wait for the result. Do NOT call 
         valid.forEach(n => unlocked.add(n));
         refreshActiveTools();
 
+        // Build a directive for the FRESH turn that follows. (Within the current
+        // run, tool schemas are frozen, so we must end the run and resume.)
+        const resumeParts: string[] = [];
         if (valid.length) {
-          pi.sendMessage({
-            customType: "tool-search-hint",
-            content:
-              `tool_search update: ${valid.join(", ")} now active. Continue original task in next turn only if work still unfinished. Do not repeat any tool call that already succeeded. Retry only tool calls that explicitly failed because tool was inactive or not found earlier.`,
-            display: false,
-            details: { enabled: valid },
-          }, {
-            deliverAs: ctx.isIdle() ? "followUp" : "steer",
-            triggerTurn: true,
-          });
+          resumeParts.push(
+            `tool_search enabled: ${valid.join(", ")}. They are now ACTIVE and directly callable in this turn. Call the one you need directly — do NOT call tool_search for them again.`,
+          );
         }
+        if (already.length) {
+          resumeParts.push(
+            `Already active and directly callable now: ${already.join(", ")}. Call them directly — do NOT call tool_search for them again.`,
+          );
+        }
+        if (invalid.length) {
+          resumeParts.push(`Unknown tool names ignored: ${invalid.join(", ")}. Re-check the list in tool_search's description.`);
+        }
+        if (!valid.length && !already.length) {
+          resumeParts.push("Continue your original task using the already-active tools.");
+        }
+
+        // Returning terminate:true ends this run immediately, which breaks any
+        // tool_search re-call loop. scheduleResume waits for the run to go idle,
+        // then starts a fresh turn whose snapshot includes the enabled tools.
+        scheduleResume(ctx, resumeParts.join("\n\n"));
 
         const parts: string[] = [];
-        if (valid.length) {
-          parts.push(`Enabled: ${valid.join(", ")}`);
-        }
-        if (already.length) parts.push(`Already active: ${already.join(", ")}`);
-        if (invalid.length) parts.push(`Unknown (ignored): ${invalid.join(", ")}`);
+        if (valid.length) parts.push(`Enabled: ${valid.join(", ")}.`);
+        if (already.length) parts.push(`Already active: ${already.join(", ")}.`);
+        if (invalid.length) parts.push(`Unknown (ignored): ${invalid.join(", ")}.`);
+        parts.push(
+          "Ending this turn so the tool(s) become available; continuing automatically next turn. Call the tool you need directly — do not call tool_search again for already-active tools.",
+        );
 
         return {
-          content: [{ type: "text", text: parts.join("\n") || "Nothing changed." }],
+          content: [{ type: "text", text: parts.join("\n") }],
           details: { enabled: valid, alreadyActive: already, unknown: invalid, active: [...unlocked] },
+          terminate: true,
         };
       },
     });
